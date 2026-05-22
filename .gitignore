@@ -33,3 +33,6 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# iWiki plugin files
+.iwiki

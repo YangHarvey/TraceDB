@@ -30,3 +30,24 @@ Key documents:
 cd agent-trace-storage-notes/synthetic-agent-trace-generator
 python3 generate_agent_traces.py --out ./sample --num-traces 1000 --avg-spans 20 --avg-events-per-span 5 --otel-json
 ```
+
+## RocksDB trace benchmark
+
+Build:
+
+```bash
+make rocksdb-static
+make
+```
+
+Run:
+
+```bash
+./build/rocksdb_trace_bench \
+  --ops agent-trace-storage-notes/synthetic-agent-trace-generator/sample/operations.jsonl \
+  --db bench-results/rocksdb-trace-first-db \
+  --destroy_db true \
+  --layout trace_first
+```
+
+See `docs/rocksdb_trace_bench.md` for details.
