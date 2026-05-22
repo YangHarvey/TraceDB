@@ -1,0 +1,35 @@
+# CodeBuddy project metadata
+.codebuddy/
+
+# Existing unrelated artifacts
+latex/
+poster.log
+
+# Generated trace workload samples
+agent-trace-storage-notes/synthetic-agent-trace-generator/sample*/
+agent-trace-storage-notes/synthetic-agent-trace-generator/synthetic-agent-traces*/
+synthetic-agent-traces*/
+
+# Local databases / benchmark outputs
+*.db
+*.sst
+*.log
+bench-results/
+results/
+
+# External dependencies / build outputs
+third_party/
+external/
+build/
+cmake-build-*/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
