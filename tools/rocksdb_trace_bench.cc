@@ -22,6 +22,8 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 
+#include "tracelsm_store.h"
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -36,6 +38,9 @@ struct Config {
   bool scan_events = true;
   uint64_t max_ops = 0;
   uint64_t progress_interval = 100000;
+  std::string object_root = "./bench-results/tracelsm-objectstore";
+  std::string object_key_prefix = "tracelsm";
+  uint64_t inline_payload_threshold = 4096;
 };
 
 struct ScanResult {
@@ -69,6 +74,8 @@ struct Metrics {
   uint64_t scanned_bytes = 0;
   uint64_t write_ns = 0;
   uint64_t logical_input_bytes = 0;
+  uint64_t rocksdb_value_bytes = 0;
+  tracelsm::TraceLSMMetrics tracelsm;
   std::vector<uint64_t> query_lat_us;
   std::vector<uint64_t> ingest_to_visible_us;
   std::unordered_map<std::string, uint64_t> op_counts;
@@ -166,7 +173,11 @@ bool ContainsStringFieldValue(const std::string& json, const std::string& field,
 
 bool LayoutUsesIndexes(const Config& cfg) {
   return cfg.layout == "trace_first_with_indexes" || cfg.layout == "update_heavy" || cfg.layout == "time_first" ||
-         cfg.layout == "tracelsm_segment";
+         cfg.layout == "tracelsm_segment" || cfg.layout == "tracelsm_object";
+}
+
+bool LayoutTraceLSMObject(const Config& cfg) {
+  return cfg.layout == "tracelsm_object";
 }
 
 bool LayoutAppendOnly(const Config& cfg) {
@@ -241,6 +252,7 @@ bool Put(rocksdb::DB* db, const rocksdb::WriteOptions& write_options, const std:
     return false;
   }
   ++metrics->writes;
+  metrics->rocksdb_value_bytes += value.size();
   if (index_write) ++metrics->index_writes;
   return true;
 }
@@ -505,13 +517,16 @@ void PrintUsage(const char* argv0) {
       << "Usage: " << argv0 << " --ops <operations.jsonl> [options]\n\n"
       << "Options:\n"
       << "  --db <path>                  RocksDB path, default ./bench-results/rocksdb-trace-bench-db\n"
-      << "  --layout <layout>            trace_first|trace_first_with_indexes|append_only|update_heavy|time_first|tracelsm_segment\n"
+      << "  --layout <layout>            trace_first|trace_first_with_indexes|append_only|update_heavy|time_first|tracelsm_segment|tracelsm_object\n"
       << "  --destroy_db true|false      Destroy DB before run, default true\n"
       << "  --disable_wal true|false     Disable RocksDB WAL, default false\n"
       << "  --sync true|false            Sync writes, default false\n"
       << "  --scan_events true|false     Include event scan in query_trace_tree, default true\n"
       << "  --max_ops <n>                Stop after n operations, default unlimited\n"
-      << "  --progress_interval <n>      Progress log interval, default 100000\n";
+      << "  --progress_interval <n>      Progress log interval, default 100000\n"
+      << "  --object_root <path>         Local object store root for tracelsm_object\n"
+      << "  --object_key_prefix <prefix> Object key prefix for tracelsm_object, default tracelsm\n"
+      << "  --inline_payload_threshold <bytes> Offload inline text at or above this size, default 4096\n";
 }
 
 bool ParseBool(const std::string& v) { return v == "true" || v == "1" || v == "yes" || v == "on"; }
@@ -535,6 +550,9 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
     else if (arg == "--scan_events") cfg->scan_events = ParseBool(need_value(arg));
     else if (arg == "--max_ops") cfg->max_ops = std::stoull(need_value(arg));
     else if (arg == "--progress_interval") cfg->progress_interval = std::stoull(need_value(arg));
+    else if (arg == "--object_root") cfg->object_root = need_value(arg);
+    else if (arg == "--object_key_prefix") cfg->object_key_prefix = need_value(arg);
+    else if (arg == "--inline_payload_threshold") cfg->inline_payload_threshold = std::stoull(need_value(arg));
     else if (arg == "--help" || arg == "-h") return false;
     else {
       std::cerr << "unknown argument: " << arg << "\n";
@@ -546,7 +564,7 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
     return false;
   }
   static const std::unordered_set<std::string> layouts = {"trace_first", "trace_first_with_indexes", "append_only",
-                                                          "update_heavy", "time_first", "tracelsm_segment"};
+                                                          "update_heavy", "time_first", "tracelsm_segment", "tracelsm_object"};
   if (!layouts.count(cfg->layout)) {
     std::cerr << "unsupported layout: " << cfg->layout << "\n";
     return false;
@@ -616,6 +634,18 @@ void PrintSummary(const Config& cfg, const Metrics& metrics, double elapsed_sec,
             << "  \"index_writes\": " << metrics.index_writes << ",\n"
             << "  \"index_write_amplification\": " << index_write_amp << ",\n"
             << "  \"logical_input_bytes\": " << metrics.logical_input_bytes << ",\n"
+            << "  \"rocksdb_value_bytes\": " << metrics.rocksdb_value_bytes << ",\n"
+            << "  \"object_store_backend\": \"" << (LayoutTraceLSMObject(cfg) ? "local" : "none") << "\",\n"
+            << "  \"object_root\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) ? cfg.object_root : "") << "\",\n"
+            << "  \"object_key_prefix\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) ? cfg.object_key_prefix : "") << "\",\n"
+            << "  \"inline_payload_threshold\": " << (LayoutTraceLSMObject(cfg) ? cfg.inline_payload_threshold : 0) << ",\n"
+            << "  \"object_puts\": " << metrics.tracelsm.object_puts << ",\n"
+            << "  \"object_bytes\": " << metrics.tracelsm.object_bytes << ",\n"
+            << "  \"object_errors\": " << metrics.tracelsm.object_errors << ",\n"
+            << "  \"offloaded_values\": " << metrics.tracelsm.offloaded_values << ",\n"
+            << "  \"offloaded_fields\": " << metrics.tracelsm.offloaded_fields << ",\n"
+            << "  \"tracelsm_original_value_bytes\": " << metrics.tracelsm.original_value_bytes << ",\n"
+            << "  \"tracelsm_compact_value_bytes\": " << metrics.tracelsm.compact_value_bytes << ",\n"
             << "  \"inserts\": " << metrics.inserts << ",\n"
             << "  \"updates\": " << metrics.updates << ",\n"
             << "  \"appends\": " << metrics.appends << ",\n"
@@ -674,13 +704,23 @@ int main(int argc, char** argv) {
   write_options.sync = cfg.sync;
   rocksdb::ReadOptions read_options;
 
+  Metrics metrics;
+  std::unique_ptr<tracelsm::ObjectStore> object_store;
+  std::unique_ptr<tracelsm::TraceLSMStore> tracelsm_store;
+  if (LayoutTraceLSMObject(cfg)) {
+    object_store = tracelsm::NewLocalFileObjectStore(cfg.object_root);
+    tracelsm::TraceLSMConfig tracelsm_cfg;
+    tracelsm_cfg.inline_payload_threshold = cfg.inline_payload_threshold;
+    tracelsm_cfg.object_key_prefix = cfg.object_key_prefix;
+    tracelsm_store = std::make_unique<tracelsm::TraceLSMStore>(tracelsm_cfg, object_store.get(), &metrics.tracelsm);
+  }
+
   std::ifstream input(cfg.operations_path);
   if (!input) {
     std::cerr << "failed to open operations file: " << cfg.operations_path << "\n";
     return 1;
   }
 
-  Metrics metrics;
   std::string line;
   const auto run_begin = Clock::now();
   while (std::getline(input, line)) {
@@ -699,9 +739,19 @@ int main(int argc, char** argv) {
     ExtractU64Field(line, "timestamp_ns", &timestamp_ns);
 
     const bool write_op = op == "insert_trace" || op == "insert_span" || op == "append_event" || op == "update_span" || op == "update_trace";
+    std::string stored_line = line;
     if (write_op) {
       ++metrics.logical_writes;
       metrics.logical_input_bytes += line.size();
+      if (LayoutTraceLSMObject(cfg)) {
+        tracelsm::PreparedValue prepared = tracelsm_store->PrepareValue(line, metrics.lines);
+        if (!prepared.ok) {
+          ++metrics.write_errors;
+          std::cerr << "tracelsm object write error: " << prepared.error << "\n";
+          continue;
+        }
+        stored_line = std::move(prepared.value);
+      }
       if (LayoutAppendOnly(cfg)) {
         Put(db.get(), write_options, KeyAppendLog(timestamp_ns, metrics.lines), line, &metrics, false);
       } else if (cfg.layout == "time_first") {
@@ -718,7 +768,7 @@ int main(int argc, char** argv) {
       }
       ExtractU64Field(line, "start_ns", &start_ns);
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeyTrace(trace_id), line, &metrics);
+        Put(db.get(), write_options, KeyTrace(trace_id), stored_line, &metrics);
         Put(db.get(), write_options, KeyRunningTrace(start_ns, trace_id), "", &metrics, true);
         if (LayoutUsesIndexes(cfg)) IndexTrace(db.get(), write_options, line, trace_id, start_ns, &metrics);
       }
@@ -732,7 +782,7 @@ int main(int argc, char** argv) {
         continue;
       }
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeySpanByTrace(trace_id, span_id), line, &metrics);
+        Put(db.get(), write_options, KeySpanByTrace(trace_id, span_id), stored_line, &metrics);
         if (ExtractStringField(line, "parent_span_id", &parent_span_id) && !parent_span_id.empty()) {
           Put(db.get(), write_options, KeyChildByParent(trace_id, parent_span_id, span_id), "", &metrics, true);
         }
@@ -749,7 +799,7 @@ int main(int argc, char** argv) {
       }
       ExtractStringField(line, "span_id", &span_id);
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeyEventByTrace(trace_id, timestamp_ns, event_id), line, &metrics);
+        Put(db.get(), write_options, KeyEventByTrace(trace_id, timestamp_ns, event_id), stored_line, &metrics);
         if (LayoutUsesIndexes(cfg)) IndexTextFields(db.get(), write_options, line, timestamp_ns, trace_id, span_id, event_id, &metrics);
       }
       ++metrics.appends;
@@ -761,7 +811,7 @@ int main(int argc, char** argv) {
         continue;
       }
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeySpanByTrace(trace_id, span_id), line, &metrics);
+        Put(db.get(), write_options, KeySpanByTrace(trace_id, span_id), stored_line, &metrics);
         if (LayoutUsesIndexes(cfg)) {
           IndexSpan(db.get(), write_options, line, trace_id, span_id, timestamp_ns, &metrics);
           if (ContainsStringFieldValue(line, "status", "error")) {
@@ -779,7 +829,7 @@ int main(int argc, char** argv) {
       }
       ExtractU64Field(line, "start_ns", &start_ns);
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeyTrace(trace_id), line, &metrics);
+        Put(db.get(), write_options, KeyTrace(trace_id), stored_line, &metrics);
         if (cfg.layout == "tracelsm_segment") Put(db.get(), write_options, KeyTraceSegment(trace_id), line, &metrics, true);
         if (start_ns != 0 && !ContainsStringFieldValue(line, "status", "running")) {
           DeleteKey(db.get(), write_options, KeyRunningTrace(start_ns, trace_id), &metrics);

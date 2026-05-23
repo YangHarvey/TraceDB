@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import random
+import shutil
 import string
 import uuid
 from collections import Counter
@@ -158,15 +159,19 @@ def random_id(prefix: str) -> str:
 def rand_text(rng: random.Random, min_bytes: int, max_bytes: int, keywords: Optional[List[str]] = None) -> str:
     size = max(1, rng.randint(min_bytes, max_bytes))
     words: List[str] = []
+    total = 0
     alphabet = string.ascii_lowercase
     if keywords:
         words.extend(keywords)
-    while sum(len(w) + 1 for w in words) < size:
+        total = sum(len(w) + 1 for w in words)
+    while total < size:
         if rng.random() < 0.03:
-            words.append(rng.choice(SEARCH_TERMS))
+            word = rng.choice(SEARCH_TERMS)
         else:
             wlen = rng.randint(3, 10)
-            words.append("".join(rng.choice(alphabet) for _ in range(wlen)))
+            word = "".join(rng.choice(alphabet) for _ in range(wlen))
+        words.append(word)
+        total += len(word) + 1
     rng.shuffle(words)
     return " ".join(words)[:size]
 
@@ -662,6 +667,87 @@ def make_query_op(rng: random.Random, op: str, ts: int, trace: Trace, spans: Lis
     return {"op": "query_trace_tree", "timestamp_ns": ts, "trace_id": trace.trace_id}
 
 
+REQUIRED_QUERY_OPS = ["query_trace_tree", "get_span", "filter_spans", "search_text", "query_running_traces", "get_thread", "list_traces_by_session", "freshness_probe"]
+
+
+def make_operations_for_trace(
+    rng: random.Random,
+    trace_index: int,
+    trace: Trace,
+    spans: List[Span],
+    events: List[Dict[str, Any]],
+    args: argparse.Namespace,
+    weights: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    trace_row = trace_to_json(trace)
+    ops.append({"op": "insert_trace", "timestamp_ns": trace.start_ns, "record": {**trace_row, "end_ns": None, "status": "running"}})
+    for span in spans:
+        insert_record = span_to_json(span)
+        insert_record["end_ns"] = None
+        insert_record["status"] = "running"
+        insert_record["latency_ms"] = None
+        ops.append({"op": "insert_span", "timestamp_ns": span.start_ns, "record": insert_record})
+        if rng.random() < args.hot_trace_query_ratio:
+            ops.append({"op": "freshness_probe", "timestamp_ns": span.start_ns + 1, "query": "get_span", "trace_id": trace.trace_id, "span_id": span.span_id})
+        progress_horizon = span.end_ns or (span.start_ns + rng.randint(30, max(31, args.long_running_min_seconds)) * NS_PER_SEC)
+        if span.status == "running" and rng.random() < args.progress_event_ratio:
+            for pct in (25, 50, 75):
+                ts = span.start_ns + max(1, (progress_horizon - span.start_ns) * pct // 100)
+                ops.append(
+                    {
+                        "op": "update_span",
+                        "timestamp_ns": ts,
+                        "key": {"span_id": span.span_id, "trace_id": span.trace_id},
+                        "patch": {"status": "running", "progress_pct": pct, "attributes": {"progress_pct": pct, **span.attributes}},
+                    }
+                )
+        if span.end_ns is not None:
+            ops.append(
+                {
+                    "op": "update_span",
+                    "timestamp_ns": span.end_ns,
+                    "key": {"span_id": span.span_id, "trace_id": span.trace_id},
+                    "patch": {"end_ns": span.end_ns, "status": span.status, "latency_ms": span.latency_ms, "kind": span.kind, "attributes": span.attributes},
+                }
+            )
+    for event in events:
+        ops.append({"op": "append_event", "timestamp_ns": event["timestamp_ns"], "record": event})
+    if trace.end_ns is not None:
+        ops.append(
+            {
+                "op": "update_trace",
+                "timestamp_ns": trace.end_ns,
+                "key": {"trace_id": trace.trace_id, "start_ns": trace.start_ns},
+                "patch": {
+                    "start_ns": trace.start_ns,
+                    "end_ns": trace.end_ns,
+                    "status": trace.status,
+                    "total_tokens": trace.total_tokens,
+                    "total_cost_usd": trace.total_cost_usd,
+                    "span_count": trace.span_count,
+                    "event_count": trace.event_count,
+                },
+            }
+        )
+
+    duration = max(1, (trace.end_ns or trace.start_ns + 60 * NS_PER_SEC) - trace.start_ns)
+    query_count = sample_poisson_like(rng, args.query_ratio, 0)
+    if args.query_ratio > 0 and rng.random() < args.query_ratio:
+        query_count += 1
+    for _ in range(query_count):
+        qts = trace.start_ns + rng.randint(0, duration)
+        op = choose_query_op(rng, weights)
+        ops.append(make_query_op(rng, op, qts, trace, spans))
+    if trace.status == "running" and rng.random() < args.hot_trace_query_ratio:
+        ops.append({"op": "query_hot_trace_tree", "timestamp_ns": trace.start_ns + rng.randint(1, duration), "trace_id": trace.trace_id})
+
+    if trace_index < len(REQUIRED_QUERY_OPS):
+        qop = REQUIRED_QUERY_OPS[trace_index]
+        ops.append(make_query_op(rng, qop, trace.start_ns + trace_index + 2, trace, spans))
+    return ops
+
+
 def make_operations(
     rng: random.Random,
     traces: List[Trace],
@@ -669,78 +755,10 @@ def make_operations(
     events_by_trace: Dict[str, List[Dict[str, Any]]],
     args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
-    ops: List[Dict[str, Any]] = []
     weights = parse_workload_mix(args.workload_mix)
-    required_queries = ["query_trace_tree", "get_span", "filter_spans", "search_text", "query_running_traces", "get_thread", "list_traces_by_session", "freshness_probe"]
-
+    ops: List[Dict[str, Any]] = []
     for trace_index, trace in enumerate(traces):
-        trace_row = trace_to_json(trace)
-        ops.append({"op": "insert_trace", "timestamp_ns": trace.start_ns, "record": {**trace_row, "end_ns": None, "status": "running"}})
-        spans = spans_by_trace[trace.trace_id]
-        for span in spans:
-            insert_record = span_to_json(span)
-            insert_record["end_ns"] = None
-            insert_record["status"] = "running"
-            insert_record["latency_ms"] = None
-            ops.append({"op": "insert_span", "timestamp_ns": span.start_ns, "record": insert_record})
-            if rng.random() < args.hot_trace_query_ratio:
-                ops.append({"op": "freshness_probe", "timestamp_ns": span.start_ns + 1, "query": "get_span", "trace_id": trace.trace_id, "span_id": span.span_id})
-            progress_horizon = span.end_ns or (span.start_ns + rng.randint(30, max(31, args.long_running_min_seconds)) * NS_PER_SEC)
-            if span.status == "running" and rng.random() < args.progress_event_ratio:
-                for pct in (25, 50, 75):
-                    ts = span.start_ns + max(1, (progress_horizon - span.start_ns) * pct // 100)
-                    ops.append(
-                        {
-                            "op": "update_span",
-                            "timestamp_ns": ts,
-                            "key": {"span_id": span.span_id, "trace_id": span.trace_id},
-                            "patch": {"status": "running", "progress_pct": pct, "attributes": {"progress_pct": pct, **span.attributes}},
-                        }
-                    )
-            if span.end_ns is not None:
-                ops.append(
-                    {
-                        "op": "update_span",
-                        "timestamp_ns": span.end_ns,
-                        "key": {"span_id": span.span_id, "trace_id": span.trace_id},
-                        "patch": {"end_ns": span.end_ns, "status": span.status, "latency_ms": span.latency_ms, "kind": span.kind, "attributes": span.attributes},
-                    }
-                )
-        for event in events_by_trace[trace.trace_id]:
-            ops.append({"op": "append_event", "timestamp_ns": event["timestamp_ns"], "record": event})
-        if trace.end_ns is not None:
-            ops.append(
-                {
-                    "op": "update_trace",
-                    "timestamp_ns": trace.end_ns,
-                    "key": {"trace_id": trace.trace_id, "start_ns": trace.start_ns},
-                    "patch": {
-                        "start_ns": trace.start_ns,
-                        "end_ns": trace.end_ns,
-                        "status": trace.status,
-                        "total_tokens": trace.total_tokens,
-                        "total_cost_usd": trace.total_cost_usd,
-                        "span_count": trace.span_count,
-                        "event_count": trace.event_count,
-                    },
-                }
-            )
-
-        duration = max(1, (trace.end_ns or trace.start_ns + 60 * NS_PER_SEC) - trace.start_ns)
-        query_count = sample_poisson_like(rng, args.query_ratio, 0)
-        if args.query_ratio > 0 and rng.random() < args.query_ratio:
-            query_count += 1
-        for _ in range(query_count):
-            qts = trace.start_ns + rng.randint(0, duration)
-            op = choose_query_op(rng, weights)
-            ops.append(make_query_op(rng, op, qts, trace, spans))
-        if trace.status == "running" and rng.random() < args.hot_trace_query_ratio:
-            ops.append({"op": "query_hot_trace_tree", "timestamp_ns": trace.start_ns + rng.randint(1, duration), "trace_id": trace.trace_id})
-
-        if trace_index < len(required_queries):
-            qop = required_queries[trace_index]
-            ops.append(make_query_op(rng, qop, trace.start_ns + trace_index + 2, trace, spans))
-
+        ops.extend(make_operations_for_trace(rng, trace_index, trace, spans_by_trace[trace.trace_id], events_by_trace[trace.trace_id], args, weights))
     ops.sort(key=lambda o: (o["timestamp_ns"], o["op"]))
     return ops
 
@@ -760,6 +778,130 @@ def make_otel_span_json(span: Span) -> Dict[str, Any]:
     }
 
 
+def jsonl_dumps(row: Dict[str, Any]) -> str:
+    return json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def operation_sort_key(line: str) -> Tuple[int, str]:
+    try:
+        row = json.loads(line)
+        return int(row.get("timestamp_ns", 0)), str(row.get("op", ""))
+    except json.JSONDecodeError:
+        return 0, ""
+
+
+class OperationBucketWriter:
+    def __init__(self, directory: Path, bucket_count: int, min_ts: int, max_ts: int) -> None:
+        self.directory = directory
+        self.bucket_count = max(1, bucket_count)
+        self.min_ts = min_ts
+        self.max_ts = max(min_ts + 1, max_ts)
+        self.files = [(directory / f"ops-{i:05d}.jsonl").open("w", encoding="utf-8") for i in range(self.bucket_count)]
+
+    def bucket_index(self, timestamp_ns: int) -> int:
+        if timestamp_ns <= self.min_ts:
+            return 0
+        if timestamp_ns >= self.max_ts:
+            return self.bucket_count - 1
+        return min(self.bucket_count - 1, ((timestamp_ns - self.min_ts) * self.bucket_count) // (self.max_ts - self.min_ts))
+
+    def write(self, op: Dict[str, Any]) -> None:
+        self.files[self.bucket_index(int(op.get("timestamp_ns", 0)))].write(jsonl_dumps(op))
+
+    def close(self) -> None:
+        for f in self.files:
+            f.close()
+
+
+def streaming_time_bounds(args: argparse.Namespace) -> Tuple[int, int]:
+    base = nowish_base_ns()
+    burst_horizon_sec = max(0, args.num_traces // 50) + args.long_running_max_seconds + 300
+    normal_horizon_sec = args.time_window_seconds + args.long_running_max_seconds + 300
+    return base, base + max(burst_horizon_sec, normal_horizon_sec) * NS_PER_SEC
+
+
+def sort_operation_buckets(bucket_dir: Path, operations_path: Path) -> int:
+    total = 0
+    with operations_path.open("w", encoding="utf-8") as out:
+        for bucket in sorted(bucket_dir.glob("ops-*.jsonl")):
+            with bucket.open("r", encoding="utf-8") as f:
+                lines = [line for line in f if line.strip()]
+            lines.sort(key=operation_sort_key)
+            out.writelines(lines)
+            total += len(lines)
+    return total
+
+
+def streaming_main(args: argparse.Namespace, rng: random.Random, out: Path) -> None:
+    active_threads: List[Dict[str, Any]] = []
+    weights = parse_workload_mix(args.workload_mix)
+    op_counts: Counter[str] = Counter()
+    counts: Counter[str] = Counter()
+    payload_bytes = 0
+    long_running_traces = 0
+    running_traces = 0
+    bucket_dir = out / "_operation_buckets"
+    if bucket_dir.exists():
+        shutil.rmtree(bucket_dir)
+    bucket_dir.mkdir(parents=True)
+    min_ts, max_ts = streaming_time_bounds(args)
+    bucket_writer = OperationBucketWriter(bucket_dir, args.operation_buckets, min_ts, max_ts)
+
+    with (out / "traces.jsonl").open("w", encoding="utf-8") as trace_f, (out / "spans.jsonl").open("w", encoding="utf-8") as span_f, (out / "events.jsonl").open("w", encoding="utf-8") as event_f, (out / "payloads.jsonl").open("w", encoding="utf-8") as payload_f:
+        otel_f = (out / "otel_spans.jsonl").open("w", encoding="utf-8") if args.otel_json else None
+        try:
+            for i in range(args.num_traces):
+                trace, spans, events, payloads = generate_trace(rng, args, i, active_threads)
+                trace_f.write(jsonl_dumps(trace_to_json(trace)))
+                counts["traces"] += 1
+                if trace.metadata.get("long_running"):
+                    long_running_traces += 1
+                if trace.status == "running":
+                    running_traces += 1
+                for span in spans:
+                    span_f.write(jsonl_dumps(span_to_json(span)))
+                    counts["spans"] += 1
+                    if otel_f is not None:
+                        otel_f.write(jsonl_dumps(make_otel_span_json(span)))
+                        counts["otel_spans"] += 1
+                for event in events:
+                    event_f.write(jsonl_dumps(event))
+                    counts["events"] += 1
+                for payload in payloads:
+                    payload_f.write(jsonl_dumps(payload))
+                    counts["payloads"] += 1
+                    payload_bytes += int(payload.get("bytes", 0))
+                for op in make_operations_for_trace(rng, i, trace, spans, events, args, weights):
+                    bucket_writer.write(op)
+                    op_counts[str(op["op"])] += 1
+                if args.streaming_progress_interval and (i + 1) % args.streaming_progress_interval == 0:
+                    print(f"generated {i + 1} traces", file=__import__("sys").stderr)
+        finally:
+            if otel_f is not None:
+                otel_f.close()
+            bucket_writer.close()
+
+    counts["operations"] = sort_operation_buckets(bucket_dir, out / "operations.jsonl")
+    if not args.keep_operation_buckets:
+        shutil.rmtree(bucket_dir)
+
+    summary = {
+        "args": vars(args),
+        "counts": dict(counts),
+        "op_counts": dict(sorted(op_counts.items())),
+        "long_running_traces": long_running_traces,
+        "running_traces": running_traces,
+        "threads": len({str(t["thread_id"]) for t in active_threads}),
+        "payload_bytes": payload_bytes,
+        "streaming": True,
+        "operation_buckets": args.operation_buckets,
+        "output_files": sorted(str(p.name) for p in out.iterdir() if p.is_file()),
+    }
+    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic Agent trace workload JSONL files.")
     parser.add_argument("--out", default="./synthetic-agent-traces", help="Output directory")
@@ -776,6 +918,10 @@ def parse_args() -> argparse.Namespace:
         else:
             parser.add_argument(flag, default=None)
     parser.add_argument("--otel-json", action="store_true", help="Also write otel_spans.jsonl")
+    parser.add_argument("--streaming-output", action="store_true", help="Write rows incrementally and externally sort operation buckets for large datasets")
+    parser.add_argument("--operation-buckets", type=int, default=512, help="Number of timestamp buckets used by --streaming-output")
+    parser.add_argument("--keep-operation-buckets", action="store_true", help="Keep temporary operation bucket files after streaming generation")
+    parser.add_argument("--streaming-progress-interval", type=int, default=10000, help="Progress interval in traces for --streaming-output; 0 disables")
     args = parser.parse_args()
 
     merged = dict(DEFAULTS)
@@ -801,6 +947,10 @@ def main() -> None:
     rng = random.Random(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    if args.streaming_output:
+        streaming_main(args, rng, out)
+        return
 
     traces: List[Trace] = []
     spans_by_trace: Dict[str, List[Span]] = {}
