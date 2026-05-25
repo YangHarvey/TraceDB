@@ -8,11 +8,12 @@ compaction、trace segment、查询时自动 hydrate。
 
 本 MVP 完成：
 
-- 从 `payloads.jsonl` 流式读取 payload。
+- 离线工具从 `payloads.jsonl` 流式读取 payload。
 - 把 payload `text` 内容写入：
   - `local` 后端：本机目录，方便复现实验。
   - `cos` 后端：腾讯云对象存储 (COS) XML API。
-- 输出 `object_manifest.jsonl` 与 `object_store_summary.json`，作为后续
+- C++ 热路径 `tracelsm_object` 也支持 `--object_backend cos`，可在写 RocksDB compact value 前同步上传大 inline payload。
+- 离线工具输出 `object_manifest.jsonl` 与 `object_store_summary.json`，作为后续
   TraceSegment / payload hydration / semantic compaction 的稳定输入。
 - 支持抽样下载校验 (`verify --deep`) 和 HEAD-only 校验。
 - 支持 `--dry-run`、`--sample-limit`、`--concurrency`、自动重试。
@@ -110,7 +111,8 @@ export COS_SECRET_ID=...
 export COS_SECRET_KEY=...
 export COS_BUCKET=mybucket-1250000000     # 必须带 appid 后缀
 export COS_REGION=ap-shanghai             # 二选一：region 或 endpoint
-# 可选
+# 默认会拼成内网域名 cos-internal.<region>.tencentcos.cn（要求与 bucket 在同一腾讯云 VPC）
+# 走公网时显式覆盖：
 # export COS_ENDPOINT=mybucket-1250000000.cos.ap-shanghai.myqcloud.com
 ```
 
@@ -145,13 +147,37 @@ python3 tools/tracelsm_object_store.py upload \
 
 `--dry-run` 不发请求，只计算 key/sha，可以先用它确认 manifest shape。
 
+### C++ 热路径 COS 使用
+
+```bash
+export COS_SECRET_ID=...
+export COS_SECRET_KEY=...
+export COS_BUCKET=mybucket-1250000000
+export COS_REGION=ap-beijing
+
+make bench-tracelsm-cos PROFILE=smoke TRACELSM_OBJECT_KEY_PREFIX=tracelsm-cpp-smoke
+```
+
+等价直接调用：
+
+```bash
+build/rocksdb_trace_bench \
+  --ops bench-results/smoke-tracelsm-object/operations.jsonl \
+  --db bench-results/smoke-tracelsm-cos/rocksdb-tracelsm-cos-db \
+  --layout tracelsm_object \
+  --object_backend cos \
+  --object_key_prefix tracelsm-cpp-smoke \
+  --inline_payload_threshold 4096 \
+  > bench-results/smoke-tracelsm-cos/rocksdb_tracelsm_cos.json
+```
+
 ## 7. 安全注意
 
 - 工具不会把 `COS_SECRET_KEY`、`Authorization` 头、或完整 payload text 写到
   `object_manifest.jsonl`、`object_store_summary.json` 或日志里。
 - 如果你拿到内部 Hunyuan 真实 trace 校准 generator，请在导出 payloads 之前
   在数据源侧做脱敏，不要让真实 prompt/completion 直接进入这个上传流程。
-- Makefile 不接受任何密钥参数；密钥只能通过环境变量传入。
+- Makefile 不接受任何密钥参数；C++ benchmark 也不接受密钥命令行参数，密钥只能通过环境变量传入。
 
 ## 8. 与设计文档的关系
 

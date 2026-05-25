@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -38,9 +40,17 @@ struct Config {
   bool scan_events = true;
   uint64_t max_ops = 0;
   uint64_t progress_interval = 100000;
+  std::string object_backend = "local";
   std::string object_root = "./bench-results/tracelsm-objectstore";
   std::string object_key_prefix = "tracelsm";
   uint64_t inline_payload_threshold = 4096;
+  std::string cos_bucket;
+  std::string cos_region;
+  std::string cos_endpoint;
+  uint64_t cos_timeout_sec = 30;
+  int cos_retries = 5;
+  int object_concurrency = 1;
+  int pipeline_depth = 1;
 };
 
 struct ScanResult {
@@ -70,6 +80,10 @@ struct Metrics {
   uint64_t queries = 0;
   uint64_t write_errors = 0;
   uint64_t parse_errors = 0;
+  uint64_t merge_reads = 0;       // read-modify-write base reads
+  uint64_t merge_misses = 0;      // updates without an existing base record
+  uint64_t merge_failures = 0;    // patches that could not be applied (fallback to overwrite)
+  uint64_t merge_read_ns = 0;
   uint64_t scanned_keys = 0;
   uint64_t scanned_bytes = 0;
   uint64_t write_ns = 0;
@@ -84,6 +98,11 @@ struct Metrics {
 
 bool StartsWith(const rocksdb::Slice& s, const std::string& prefix) {
   return s.size() >= prefix.size() && std::memcmp(s.data(), prefix.data(), prefix.size()) == 0;
+}
+
+std::string GetEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? "" : value;
 }
 
 std::string EscapeJson(const std::string& input) {
@@ -169,6 +188,250 @@ bool ExtractU64Field(const std::string& json, const std::string& field, uint64_t
 bool ContainsStringFieldValue(const std::string& json, const std::string& field, const std::string& expected) {
   std::string value;
   return ExtractStringField(json, field, &value) && value == expected;
+}
+
+// Returns the [begin, end) byte range of the value associated with `field` at
+// the top level of `json`. The range covers only the value, not the field name
+// or the colon. Handles strings, numbers, booleans, null, objects and arrays.
+// Returns (npos, npos) when the field is not found or the value is malformed.
+std::pair<size_t, size_t> FindRawFieldRange(const std::string& json, const std::string& field) {
+  const size_t pos = FindFieldValue(json, field);
+  if (pos == std::string::npos) return {std::string::npos, std::string::npos};
+  size_t i = pos + field.size() + 3;  // skip "field":
+  while (i < json.size() && json[i] == ' ') ++i;
+  if (i >= json.size()) return {std::string::npos, std::string::npos};
+  const size_t start = i;
+  const char c = json[i];
+  if (c == '"') {
+    // Quoted string: walk to closing quote, handle escapes.
+    ++i;
+    bool escaped = false;
+    for (; i < json.size(); ++i) {
+      const char ch = json[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        return {start, i + 1};
+      }
+    }
+    return {std::string::npos, std::string::npos};
+  }
+  if (c == '{' || c == '[') {
+    // Nested object/array: balance brackets while respecting strings.
+    const char open = c;
+    const char close = (open == '{') ? '}' : ']';
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (; i < json.size(); ++i) {
+      const char ch = json[i];
+      if (in_string) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == '"') {
+          in_string = false;
+        }
+        continue;
+      }
+      if (ch == '"') {
+        in_string = true;
+      } else if (ch == open) {
+        ++depth;
+      } else if (ch == close) {
+        --depth;
+        if (depth == 0) return {start, i + 1};
+      }
+    }
+    return {std::string::npos, std::string::npos};
+  }
+  // Bare literal: number, true, false, null. Stop at separators.
+  for (; i < json.size(); ++i) {
+    const char ch = json[i];
+    if (ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') break;
+  }
+  if (i == start) return {std::string::npos, std::string::npos};
+  return {start, i};
+}
+
+// Parse a JSON value starting at byte position `pos` in `buf`. The parser
+// understands strings (with escapes), nested objects/arrays (balanced brackets
+// while respecting strings) and bare literals (number/true/false/null which
+// stop at separators). Returns [begin, end). Returns (npos, npos) on failure.
+std::pair<size_t, size_t> ParseValueRangeAt(const std::string& buf, size_t pos) {
+  while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == '\n' || buf[pos] == '\r' || buf[pos] == '\t')) ++pos;
+  if (pos >= buf.size()) return {std::string::npos, std::string::npos};
+  const size_t start = pos;
+  const char c = buf[pos];
+  if (c == '"') {
+    ++pos;
+    bool escaped = false;
+    for (; pos < buf.size(); ++pos) {
+      const char ch = buf[pos];
+      if (escaped) { escaped = false; continue; }
+      if (ch == '\\') { escaped = true; }
+      else if (ch == '"') { return {start, pos + 1}; }
+    }
+    return {std::string::npos, std::string::npos};
+  }
+  if (c == '{' || c == '[') {
+    const char open = c;
+    const char close = (open == '{') ? '}' : ']';
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (; pos < buf.size(); ++pos) {
+      const char ch = buf[pos];
+      if (in_string) {
+        if (escaped) { escaped = false; }
+        else if (ch == '\\') { escaped = true; }
+        else if (ch == '"') { in_string = false; }
+        continue;
+      }
+      if (ch == '"') { in_string = true; }
+      else if (ch == open) { ++depth; }
+      else if (ch == close) {
+        --depth;
+        if (depth == 0) return {start, pos + 1};
+      }
+    }
+    return {std::string::npos, std::string::npos};
+  }
+  for (; pos < buf.size(); ++pos) {
+    const char ch = buf[pos];
+    if (ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') break;
+  }
+  if (pos == start) return {std::string::npos, std::string::npos};
+  return {start, pos};
+}
+
+// Locate the [begin, end) byte range of the value bound to a top-level field
+// inside an object literal. Unlike FindRawFieldRange, this version walks the
+// object respecting nested string/array/object scopes so it never matches a
+// field that lives inside a nested value.
+std::pair<size_t, size_t> FindTopLevelFieldRange(const std::string& obj, const std::string& field) {
+  if (obj.size() < 2 || obj.front() != '{') return {std::string::npos, std::string::npos};
+  size_t i = 1;
+  while (i < obj.size()) {
+    while (i < obj.size() && (obj[i] == ' ' || obj[i] == ',' || obj[i] == '\n' || obj[i] == '\r' || obj[i] == '\t')) ++i;
+    if (i >= obj.size() || obj[i] == '}') return {std::string::npos, std::string::npos};
+    if (obj[i] != '"') return {std::string::npos, std::string::npos};
+    const size_t key_start = i + 1;
+    ++i;
+    bool escaped = false;
+    while (i < obj.size()) {
+      if (escaped) { escaped = false; ++i; continue; }
+      if (obj[i] == '\\') { escaped = true; ++i; continue; }
+      if (obj[i] == '"') break;
+      ++i;
+    }
+    if (i >= obj.size()) return {std::string::npos, std::string::npos};
+    const std::string key = obj.substr(key_start, i - key_start);
+    ++i;  // closing quote
+    while (i < obj.size() && obj[i] == ' ') ++i;
+    if (i >= obj.size() || obj[i] != ':') return {std::string::npos, std::string::npos};
+    ++i;  // colon
+    auto value_range = ParseValueRangeAt(obj, i);
+    if (value_range.first == std::string::npos) return {std::string::npos, std::string::npos};
+    if (key == field) return value_range;
+    i = value_range.second;
+  }
+  return {std::string::npos, std::string::npos};
+}
+
+// Apply patch fields onto an existing inserted value to produce the merged
+// stored value. Stored shape stays `{"op":"insert_*","timestamp_ns":...,"record":{...}}`
+// so downstream substring extractors keep working.
+//
+// Strategy: tokenize the patch object's top-level fields and, for each field,
+// either replace the field in the record (top-level only) or append it.
+//
+// `patch_object` is the raw text of the patch object including the surrounding
+// braces, e.g. `{"end_ns":..., "status":"success", ...}`.
+//
+// Returns false if anything looks malformed (e.g. record not found); caller
+// should fall back to writing the patch op as-is in that case.
+bool ApplyPatchToRecord(const std::string& stored_old, const std::string& patch_object, uint64_t new_timestamp_ns,
+                        std::string* out) {
+  // Find the record object inside the stored value (top-level only).
+  auto record_range = FindTopLevelFieldRange(stored_old, "record");
+  if (record_range.first == std::string::npos) return false;
+  std::string record = stored_old.substr(record_range.first, record_range.second - record_range.first);
+  if (record.size() < 2 || record.front() != '{' || record.back() != '}') return false;
+
+  // Walk patch_object's top-level fields. For each one, replace or append in record.
+  if (patch_object.size() < 2 || patch_object.front() != '{' || patch_object.back() != '}') return false;
+  size_t i = 1;  // skip leading {
+  while (i < patch_object.size()) {
+    while (i < patch_object.size() && (patch_object[i] == ' ' || patch_object[i] == ',' || patch_object[i] == '\n' ||
+                                       patch_object[i] == '\r' || patch_object[i] == '\t')) {
+      ++i;
+    }
+    if (i >= patch_object.size() || patch_object[i] == '}') break;
+    if (patch_object[i] != '"') return false;
+    const size_t key_start = i + 1;
+    ++i;
+    bool escaped = false;
+    while (i < patch_object.size()) {
+      if (escaped) { escaped = false; ++i; continue; }
+      if (patch_object[i] == '\\') { escaped = true; ++i; continue; }
+      if (patch_object[i] == '"') break;
+      ++i;
+    }
+    if (i >= patch_object.size()) return false;
+    const std::string key = patch_object.substr(key_start, i - key_start);
+    ++i;  // closing quote
+    while (i < patch_object.size() && patch_object[i] == ' ') ++i;
+    if (i >= patch_object.size() || patch_object[i] != ':') return false;
+    ++i;  // colon
+    auto value_range = ParseValueRangeAt(patch_object, i);
+    if (value_range.first == std::string::npos) return false;
+    std::string value_raw = patch_object.substr(value_range.first, value_range.second - value_range.first);
+
+    // Replace or insert key:value into the record at the top level only.
+    auto existing = FindTopLevelFieldRange(record, key);
+    if (existing.first != std::string::npos) {
+      record.replace(existing.first, existing.second - existing.first, value_raw);
+    } else {
+      const std::string entry = std::string("\"") + key + "\":" + value_raw;
+      if (record == "{}") {
+        record = std::string("{") + entry + "}";
+      } else {
+        record.insert(record.size() - 1, "," + entry);
+      }
+    }
+
+    // Advance past this value in patch_object.
+    i = value_range.second;
+  }
+
+  // Build merged stored value. We rewrite the timestamp_ns and the record,
+  // keeping other top-level fields if any (defensive: there shouldn't be any).
+  std::string head = "{\"op\":\"insert_";
+  // Detect whether the original stored shell was insert_trace or insert_span.
+  std::string op_value;
+  if (ExtractStringField(stored_old, "op", &op_value)) {
+    if (op_value == "insert_span" || op_value == "update_span") head += "span";
+    else head += "trace";
+  } else {
+    head += "trace";
+  }
+  head += "\",\"timestamp_ns\":" + std::to_string(new_timestamp_ns) + ",\"record\":";
+  *out = head + record + "}";
+  return true;
+}
+
+// Wrap a record object into a synthetic insert_* shell. Used when an update
+// arrives before any insert (defensive) so that downstream layers still see the
+// canonical `{op:insert_*, timestamp_ns, record:{...}}` shape.
+std::string WrapRecordAsInsert(const std::string& kind, uint64_t timestamp_ns, const std::string& record_object) {
+  return std::string("{\"op\":\"insert_") + kind + "\",\"timestamp_ns\":" + std::to_string(timestamp_ns) +
+         ",\"record\":" + record_object + "}";
 }
 
 bool LayoutUsesIndexes(const Config& cfg) {
@@ -524,9 +787,17 @@ void PrintUsage(const char* argv0) {
       << "  --scan_events true|false     Include event scan in query_trace_tree, default true\n"
       << "  --max_ops <n>                Stop after n operations, default unlimited\n"
       << "  --progress_interval <n>      Progress log interval, default 100000\n"
+      << "  --object_backend <backend>   local|cos for tracelsm_object, default local\n"
       << "  --object_root <path>         Local object store root for tracelsm_object\n"
       << "  --object_key_prefix <prefix> Object key prefix for tracelsm_object, default tracelsm\n"
-      << "  --inline_payload_threshold <bytes> Offload inline text at or above this size, default 4096\n";
+      << "  --inline_payload_threshold <bytes> Offload inline text at or above this size, default 4096\n"
+      << "  --cos_bucket <bucket>        COS bucket name; defaults to COS_BUCKET env\n"
+      << "  --cos_region <region>        COS region; defaults to COS_REGION env\n"
+      << "  --cos_endpoint <host>        Optional COS endpoint; defaults to COS_ENDPOINT env\n"
+      << "  --cos_timeout_sec <sec>      COS request timeout, default 30\n"
+      << "  --cos_retries <n>            COS retry count, default 5\n"
+      << "  --object_concurrency <n>     # of background workers issuing COS PUTs concurrently, default 1\n"
+      << "  --pipeline_depth <n>         # of write records pre-staged with PUTs in flight, default 1\n";
 }
 
 bool ParseBool(const std::string& v) { return v == "true" || v == "1" || v == "yes" || v == "on"; }
@@ -550,9 +821,17 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
     else if (arg == "--scan_events") cfg->scan_events = ParseBool(need_value(arg));
     else if (arg == "--max_ops") cfg->max_ops = std::stoull(need_value(arg));
     else if (arg == "--progress_interval") cfg->progress_interval = std::stoull(need_value(arg));
+    else if (arg == "--object_backend") cfg->object_backend = need_value(arg);
     else if (arg == "--object_root") cfg->object_root = need_value(arg);
     else if (arg == "--object_key_prefix") cfg->object_key_prefix = need_value(arg);
     else if (arg == "--inline_payload_threshold") cfg->inline_payload_threshold = std::stoull(need_value(arg));
+    else if (arg == "--cos_bucket") cfg->cos_bucket = need_value(arg);
+    else if (arg == "--cos_region") cfg->cos_region = need_value(arg);
+    else if (arg == "--cos_endpoint") cfg->cos_endpoint = need_value(arg);
+    else if (arg == "--cos_timeout_sec") cfg->cos_timeout_sec = std::stoull(need_value(arg));
+    else if (arg == "--cos_retries") cfg->cos_retries = std::stoi(need_value(arg));
+    else if (arg == "--object_concurrency") cfg->object_concurrency = std::stoi(need_value(arg));
+    else if (arg == "--pipeline_depth") cfg->pipeline_depth = std::stoi(need_value(arg));
     else if (arg == "--help" || arg == "-h") return false;
     else {
       std::cerr << "unknown argument: " << arg << "\n";
@@ -567,6 +846,10 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
                                                           "update_heavy", "time_first", "tracelsm_segment", "tracelsm_object"};
   if (!layouts.count(cfg->layout)) {
     std::cerr << "unsupported layout: " << cfg->layout << "\n";
+    return false;
+  }
+  if (cfg->object_backend != "local" && cfg->object_backend != "cos") {
+    std::cerr << "unsupported object backend: " << cfg->object_backend << "\n";
     return false;
   }
   return true;
@@ -635,10 +918,15 @@ void PrintSummary(const Config& cfg, const Metrics& metrics, double elapsed_sec,
             << "  \"index_write_amplification\": " << index_write_amp << ",\n"
             << "  \"logical_input_bytes\": " << metrics.logical_input_bytes << ",\n"
             << "  \"rocksdb_value_bytes\": " << metrics.rocksdb_value_bytes << ",\n"
-            << "  \"object_store_backend\": \"" << (LayoutTraceLSMObject(cfg) ? "local" : "none") << "\",\n"
-            << "  \"object_root\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) ? cfg.object_root : "") << "\",\n"
+            << "  \"object_store_backend\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) ? cfg.object_backend : "none") << "\",\n"
+            << "  \"object_root\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) && cfg.object_backend == "local" ? cfg.object_root : "") << "\",\n"
+            << "  \"cos_bucket\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) && cfg.object_backend == "cos" ? cfg.cos_bucket : "") << "\",\n"
+            << "  \"cos_region\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) && cfg.object_backend == "cos" ? cfg.cos_region : "") << "\",\n"
+            << "  \"cos_endpoint\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) && cfg.object_backend == "cos" ? cfg.cos_endpoint : "") << "\",\n"
             << "  \"object_key_prefix\": \"" << EscapeJson(LayoutTraceLSMObject(cfg) ? cfg.object_key_prefix : "") << "\",\n"
             << "  \"inline_payload_threshold\": " << (LayoutTraceLSMObject(cfg) ? cfg.inline_payload_threshold : 0) << ",\n"
+            << "  \"object_concurrency\": " << (LayoutTraceLSMObject(cfg) ? cfg.object_concurrency : 0) << ",\n"
+            << "  \"pipeline_depth\": " << (LayoutTraceLSMObject(cfg) ? cfg.pipeline_depth : 0) << ",\n"
             << "  \"object_puts\": " << metrics.tracelsm.object_puts << ",\n"
             << "  \"object_bytes\": " << metrics.tracelsm.object_bytes << ",\n"
             << "  \"object_errors\": " << metrics.tracelsm.object_errors << ",\n"
@@ -652,6 +940,10 @@ void PrintSummary(const Config& cfg, const Metrics& metrics, double elapsed_sec,
             << "  \"queries\": " << metrics.queries << ",\n"
             << "  \"parse_errors\": " << metrics.parse_errors << ",\n"
             << "  \"write_errors\": " << metrics.write_errors << ",\n"
+            << "  \"merge_reads\": " << metrics.merge_reads << ",\n"
+            << "  \"merge_misses\": " << metrics.merge_misses << ",\n"
+            << "  \"merge_failures\": " << metrics.merge_failures << ",\n"
+            << "  \"merge_read_ms\": " << (metrics.merge_read_ns / 1'000'000ULL) << ",\n"
             << "  \"elapsed_sec\": " << elapsed_sec << ",\n"
             << "  \"end_to_end_ops_per_sec\": " << end_to_end_ops_per_sec << ",\n"
             << "  \"write_time_sec\": " << write_sec << ",\n"
@@ -708,7 +1000,28 @@ int main(int argc, char** argv) {
   std::unique_ptr<tracelsm::ObjectStore> object_store;
   std::unique_ptr<tracelsm::TraceLSMStore> tracelsm_store;
   if (LayoutTraceLSMObject(cfg)) {
-    object_store = tracelsm::NewLocalFileObjectStore(cfg.object_root);
+    if (cfg.object_backend == "cos") {
+      tracelsm::CosObjectStoreOptions cos_options;
+      cos_options.secret_id = GetEnv("COS_SECRET_ID");
+      cos_options.secret_key = GetEnv("COS_SECRET_KEY");
+      cos_options.bucket = cfg.cos_bucket.empty() ? GetEnv("COS_BUCKET") : cfg.cos_bucket;
+      cos_options.region = cfg.cos_region.empty() ? GetEnv("COS_REGION") : cfg.cos_region;
+      cos_options.endpoint = cfg.cos_endpoint.empty() ? GetEnv("COS_ENDPOINT") : cfg.cos_endpoint;
+      cos_options.timeout_sec = cfg.cos_timeout_sec;
+      cos_options.max_retries = cfg.cos_retries;
+      cos_options.concurrency = std::max(1, cfg.object_concurrency);
+      cfg.cos_bucket = cos_options.bucket;
+      cfg.cos_region = cos_options.region;
+      cfg.cos_endpoint = cos_options.endpoint;
+      if (cos_options.secret_id.empty() || cos_options.secret_key.empty() || cos_options.bucket.empty() ||
+          (cos_options.region.empty() && cos_options.endpoint.empty())) {
+        std::cerr << "COS backend requires COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET, and COS_REGION or COS_ENDPOINT\n";
+        return 2;
+      }
+      object_store = tracelsm::NewCosObjectStore(std::move(cos_options));
+    } else {
+      object_store = tracelsm::NewLocalFileObjectStore(cfg.object_root);
+    }
     tracelsm::TraceLSMConfig tracelsm_cfg;
     tracelsm_cfg.inline_payload_threshold = cfg.inline_payload_threshold;
     tracelsm_cfg.object_key_prefix = cfg.object_key_prefix;
@@ -723,9 +1036,54 @@ int main(int argc, char** argv) {
 
   std::string line;
   const auto run_begin = Clock::now();
-  while (std::getline(input, line)) {
-    if (line.empty()) continue;
+
+  // Pipeline buffer: when TraceLSM-object backend is active, we pre-stage the next
+  // `pipeline_depth` write records by submitting their object PUTs ahead of time.
+  // The main loop below pops the head of the buffer in input order, so RocksDB
+  // write order is identical to the serial baseline.
+  struct Staged {
+    std::string line;
+    uint64_t sequence = 0;
+    bool is_write_op = false;
+    std::optional<tracelsm::PendingPreparedValue> pending;  // valid iff is_write_op && tracelsm-object layout
+  };
+  const bool tracelsm_object = LayoutTraceLSMObject(cfg);
+  const int depth = std::max(1, cfg.pipeline_depth);
+  std::deque<Staged> staged;
+  bool input_eof = false;
+
+  auto try_fill_pipeline = [&]() {
+    while (!input_eof && static_cast<int>(staged.size()) < depth) {
+      if (cfg.max_ops != 0 && metrics.lines + staged.size() >= cfg.max_ops) break;
+      std::string raw;
+      if (!std::getline(input, raw)) {
+        input_eof = true;
+        break;
+      }
+      if (raw.empty()) continue;
+      Staged item;
+      item.sequence = metrics.lines + staged.size() + 1;
+      item.line = std::move(raw);
+      std::string op_peek;
+      if (ExtractStringField(item.line, "op", &op_peek)) {
+        item.is_write_op = (op_peek == "insert_trace" || op_peek == "insert_span" ||
+                            op_peek == "append_event" || op_peek == "update_span" ||
+                            op_peek == "update_trace");
+      }
+      if (tracelsm_object && item.is_write_op) {
+        item.pending = tracelsm_store->PrepareValueAsync(item.line, item.sequence);
+      }
+      staged.push_back(std::move(item));
+    }
+  };
+
+  while (true) {
+    try_fill_pipeline();
+    if (staged.empty()) break;
+    Staged head = std::move(staged.front());
+    staged.pop_front();
     if (cfg.max_ops != 0 && metrics.lines >= cfg.max_ops) break;
+    line = std::move(head.line);
     ++metrics.lines;
 
     std::string op;
@@ -744,7 +1102,10 @@ int main(int argc, char** argv) {
       ++metrics.logical_writes;
       metrics.logical_input_bytes += line.size();
       if (LayoutTraceLSMObject(cfg)) {
-        tracelsm::PreparedValue prepared = tracelsm_store->PrepareValue(line, metrics.lines);
+        tracelsm::PendingPreparedValue pp =
+            head.pending.has_value() ? std::move(*head.pending)
+                                     : tracelsm_store->PrepareValueAsync(line, metrics.lines);
+        tracelsm::PreparedValue prepared = tracelsm_store->Finalize(std::move(pp));
         if (!prepared.ok) {
           ++metrics.write_errors;
           std::cerr << "tracelsm object write error: " << prepared.error << "\n";
@@ -811,7 +1172,29 @@ int main(int argc, char** argv) {
         continue;
       }
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeySpanByTrace(trace_id, span_id), stored_line, &metrics);
+        // Read-modify-write: merge patch fields onto the existing record so that
+        // fields populated only at insert time (session_id, parent_span_id,
+        // attributes captured at start, ...) survive the update.
+        const std::string key = KeySpanByTrace(trace_id, span_id);
+        std::string old_value;
+        const auto t0 = Clock::now();
+        rocksdb::Status read_s = db->Get(read_options, key, &old_value);
+        metrics.merge_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++metrics.merge_reads;
+        std::string merged_value;
+        bool merged_ok = false;
+        if (read_s.ok()) {
+          auto patch_range = FindTopLevelFieldRange(line, "patch");
+          if (patch_range.first != std::string::npos) {
+            const std::string patch_obj = line.substr(patch_range.first, patch_range.second - patch_range.first);
+            merged_ok = ApplyPatchToRecord(old_value, patch_obj, timestamp_ns, &merged_value);
+          }
+          if (!merged_ok) ++metrics.merge_failures;
+        } else {
+          ++metrics.merge_misses;
+        }
+        const std::string& value_to_write = merged_ok ? merged_value : stored_line;
+        Put(db.get(), write_options, key, value_to_write, &metrics);
         if (LayoutUsesIndexes(cfg)) {
           IndexSpan(db.get(), write_options, line, trace_id, span_id, timestamp_ns, &metrics);
           if (ContainsStringFieldValue(line, "status", "error")) {
@@ -829,7 +1212,26 @@ int main(int argc, char** argv) {
       }
       ExtractU64Field(line, "start_ns", &start_ns);
       if (!LayoutAppendOnly(cfg)) {
-        Put(db.get(), write_options, KeyTrace(trace_id), stored_line, &metrics);
+        const std::string key = KeyTrace(trace_id);
+        std::string old_value;
+        const auto t0 = Clock::now();
+        rocksdb::Status read_s = db->Get(read_options, key, &old_value);
+        metrics.merge_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++metrics.merge_reads;
+        std::string merged_value;
+        bool merged_ok = false;
+        if (read_s.ok()) {
+          auto patch_range = FindTopLevelFieldRange(line, "patch");
+          if (patch_range.first != std::string::npos) {
+            const std::string patch_obj = line.substr(patch_range.first, patch_range.second - patch_range.first);
+            merged_ok = ApplyPatchToRecord(old_value, patch_obj, timestamp_ns, &merged_value);
+          }
+          if (!merged_ok) ++metrics.merge_failures;
+        } else {
+          ++metrics.merge_misses;
+        }
+        const std::string& value_to_write = merged_ok ? merged_value : stored_line;
+        Put(db.get(), write_options, key, value_to_write, &metrics);
         if (cfg.layout == "tracelsm_segment") Put(db.get(), write_options, KeyTraceSegment(trace_id), line, &metrics, true);
         if (start_ns != 0 && !ContainsStringFieldValue(line, "status", "running")) {
           DeleteKey(db.get(), write_options, KeyRunningTrace(start_ns, trace_id), &metrics);

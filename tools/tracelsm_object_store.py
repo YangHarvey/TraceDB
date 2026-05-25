@@ -156,8 +156,15 @@ class CosObjectStore(ObjectStoreBackend):
         self.secret_key = secret_key
         self.bucket = bucket
         self.region = region
-        self.host = endpoint or f"{bucket}.cos.{region}.myqcloud.com"
-        self.host = self.host.replace("https://", "").replace("http://", "").strip("/")
+        # Default to Tencent Cloud internal endpoint; this tool is expected to run inside the same VPC.
+        host = endpoint or (f"cos-internal.{region}.tencentcos.cn" if region else "")
+        host = host.replace("https://", "").replace("http://", "").strip("/")
+        # Region-level endpoints (cos.<region>.myqcloud.com / cos-internal.<region>.tencentcos.cn)
+        # need the bucket prefix for vhost-style addressing.
+        bucket_prefix = f"{bucket}."
+        if host and not host.startswith(bucket_prefix):
+            host = bucket_prefix + host
+        self.host = host
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
 

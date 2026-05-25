@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <future>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -144,12 +145,17 @@ TraceLSMStore::TraceLSMStore(TraceLSMConfig config, ObjectStore* object_store, T
     : config_(std::move(config)), object_store_(object_store), metrics_(metrics) {}
 
 PreparedValue TraceLSMStore::PrepareValue(const std::string& value, uint64_t sequence) {
-  PreparedValue prepared;
+  return Finalize(PrepareValueAsync(value, sequence));
+}
+
+PendingPreparedValue TraceLSMStore::PrepareValueAsync(const std::string& value, uint64_t sequence) {
+  PendingPreparedValue out;
+  PreparedValue& prepared = out.prepared;
   prepared.value = value;
   if (metrics_ != nullptr) metrics_->original_value_bytes += value.size();
   if (object_store_ == nullptr || config_.inline_payload_threshold == 0) {
     if (metrics_ != nullptr) metrics_->compact_value_bytes += prepared.value.size();
-    return prepared;
+    return out;
   }
 
   std::string trace_id;
@@ -164,6 +170,7 @@ PreparedValue TraceLSMStore::PrepareValue(const std::string& value, uint64_t seq
   kind = CleanPathPart(kind, "text");
 
   std::vector<StringFieldMatch> matches = FindStringFieldMatches(value, "text");
+  // Iterate from tail to head so earlier indices remain valid after in-place replacement.
   uint64_t ordinal = 0;
   for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
     const StringFieldMatch& match = *it;
@@ -172,13 +179,8 @@ PreparedValue TraceLSMStore::PrepareValue(const std::string& value, uint64_t seq
     const std::string payload_id = "pay_" + HexU64(sequence) + "_" + HexU64(++ordinal) + "_" + HexU64(Fnv1a64(match.decoded));
     const std::string payload_ref = BuildPayloadRef(trace_id, span_id, kind, payload_id);
     const std::string object_key = BuildObjectKey(config_.object_key_prefix, trace_id, span_id, kind, payload_id);
-    const Status status = object_store_->Put(object_key, match.decoded);
-    if (!status.ok) {
-      if (metrics_ != nullptr) ++metrics_->object_errors;
-      prepared.ok = false;
-      prepared.error = status.message;
-      return prepared;
-    }
+
+    out.pending.push_back(object_store_->PutAsync(object_key, match.decoded));
 
     const std::string digest = "fnv64:" + HexU64(Fnv1a64(match.decoded));
     const std::string replacement =
@@ -199,6 +201,19 @@ PreparedValue TraceLSMStore::PrepareValue(const std::string& value, uint64_t seq
 
   if (prepared.offloaded && metrics_ != nullptr) ++metrics_->offloaded_values;
   if (metrics_ != nullptr) metrics_->compact_value_bytes += prepared.value.size();
+  return out;
+}
+
+PreparedValue TraceLSMStore::Finalize(PendingPreparedValue pending) {
+  PreparedValue prepared = std::move(pending.prepared);
+  for (auto& fut : pending.pending) {
+    Status s = fut.get();
+    if (!s.ok) {
+      if (metrics_ != nullptr) ++metrics_->object_errors;
+      prepared.ok = false;
+      prepared.error = s.message;
+    }
+  }
   return prepared;
 }
 

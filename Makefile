@@ -16,16 +16,21 @@ OBJECTSTORE_CONCURRENCY ?= 4
 OBJECTSTORE_SAMPLE_LIMIT ?= 0
 OBJECTSTORE_VERIFY_LIMIT ?= 200
 OBJECTSTORE_VERIFY_STRIDE ?= 1
+TRACELSM_OBJECT_BACKEND ?= local
 TRACELSM_OBJECT_ROOT ?= $(BENCH_RESULTS_DIR)/$(PROFILE)-tracelsm-object/tracelsm-objectstore
 TRACELSM_OBJECT_KEY_PREFIX ?= tracelsm
 TRACELSM_INLINE_PAYLOAD_THRESHOLD ?= 4096
+TRACELSM_COS_TIMEOUT_SEC ?= 30
+TRACELSM_COS_RETRIES ?= 5
+TRACELSM_OBJECT_CONCURRENCY ?= 16
+TRACELSM_PIPELINE_DEPTH ?= 64
 
 CXXFLAGS ?= -std=c++20 -O2 -g
 CPPFLAGS += -I$(ROCKSDB_DIR)/include -I$(ROCKSDB_DIR) -Itools
-LDFLAGS += $(ROCKSDB_DIR)/librocksdb.a -lpthread -ldl -lz
+LDFLAGS += $(ROCKSDB_DIR)/librocksdb.a -lpthread -ldl -lz -lcurl -lssl -lcrypto
 BENCH_SRCS := tools/rocksdb_trace_bench.cc tools/tracelsm_object_store.cc tools/tracelsm_store.cc
 
-.PHONY: all clean rocksdb-static gen bench-smoke bench-dev bench-standard bench-write-heavy bench-long-running bench-payload-heavy bench-deep-tree bench-layouts bench-tracelsm-object external-baseline clickhouse-bench object-store-upload object-store-verify object-store-cos-upload object-store-cos-verify
+.PHONY: all clean rocksdb-static gen bench-smoke bench-dev bench-standard bench-write-heavy bench-long-running bench-payload-heavy bench-deep-tree bench-layouts bench-tracelsm-object bench-tracelsm-cos external-baseline clickhouse-bench object-store-upload object-store-verify object-store-cos-upload object-store-cos-verify
 
 all: $(BUILD_DIR)/rocksdb_trace_bench
 
@@ -74,7 +79,7 @@ bench-layouts: all
 	python3 $(GENERATOR) --profile $(PROFILE) --out $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts --otel-json
 	for layout in $(LAYOUTS); do \
 	  extra=""; \
-	  if [ "$$layout" = "tracelsm_object" ]; then extra="--object_root $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts/tracelsm-objectstore --object_key_prefix $(TRACELSM_OBJECT_KEY_PREFIX) --inline_payload_threshold $(TRACELSM_INLINE_PAYLOAD_THRESHOLD)"; fi; \
+	  if [ "$$layout" = "tracelsm_object" ]; then extra="--object_backend $(TRACELSM_OBJECT_BACKEND) --object_root $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts/tracelsm-objectstore --object_key_prefix $(TRACELSM_OBJECT_KEY_PREFIX) --inline_payload_threshold $(TRACELSM_INLINE_PAYLOAD_THRESHOLD) --cos_timeout_sec $(TRACELSM_COS_TIMEOUT_SEC) --cos_retries $(TRACELSM_COS_RETRIES)"; fi; \
 	  $(BUILD_DIR)/rocksdb_trace_bench --ops $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts/operations.jsonl --db $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts/rocksdb-$$layout-db --layout $$layout $$extra > $(BENCH_RESULTS_DIR)/$(PROFILE)-layouts/rocksdb_$$layout.json; \
 	done
 
@@ -85,10 +90,18 @@ bench-tracelsm-object: all
 	  --ops $(BENCH_RESULTS_DIR)/$(PROFILE)-tracelsm-object/operations.jsonl \
 	  --db $(BENCH_RESULTS_DIR)/$(PROFILE)-tracelsm-object/rocksdb-tracelsm-object-db \
 	  --layout tracelsm_object \
+	  --object_backend $(TRACELSM_OBJECT_BACKEND) \
 	  --object_root $(TRACELSM_OBJECT_ROOT) \
 	  --object_key_prefix $(TRACELSM_OBJECT_KEY_PREFIX) \
 	  --inline_payload_threshold $(TRACELSM_INLINE_PAYLOAD_THRESHOLD) \
+	  --cos_timeout_sec $(TRACELSM_COS_TIMEOUT_SEC) \
+	  --cos_retries $(TRACELSM_COS_RETRIES) \
+	  --object_concurrency $(TRACELSM_OBJECT_CONCURRENCY) \
+	  --pipeline_depth $(TRACELSM_PIPELINE_DEPTH) \
 	  > $(BENCH_RESULTS_DIR)/$(PROFILE)-tracelsm-object/rocksdb_tracelsm_object.json
+
+bench-tracelsm-cos: TRACELSM_OBJECT_BACKEND=cos
+bench-tracelsm-cos: bench-tracelsm-object
 
 external-baseline:
 	python3 tools/external_baseline_export.py --input $(BENCH_RESULTS_DIR)/$(PROFILE) --out $(BENCH_RESULTS_DIR)/$(PROFILE)/external-baselines

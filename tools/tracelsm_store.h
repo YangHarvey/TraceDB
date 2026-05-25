@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <future>
 #include <string>
+#include <vector>
 
 #include "tracelsm_object_store.h"
 
@@ -29,11 +31,29 @@ struct PreparedValue {
   std::string error;
 };
 
+// Captures an in-flight PrepareValue: object PUTs have been submitted to the
+// async pool but may not yet have completed. Call TraceLSMStore::Finalize to
+// block until all PUTs land and obtain the final PreparedValue.
+struct PendingPreparedValue {
+  PreparedValue prepared;
+  std::vector<std::future<Status>> pending;
+};
+
 class TraceLSMStore {
  public:
   TraceLSMStore(TraceLSMConfig config, ObjectStore* object_store, TraceLSMMetrics* metrics);
 
+  // Synchronous variant: submits and waits for all PUTs.
   PreparedValue PrepareValue(const std::string& value, uint64_t sequence);
+
+  // Two-phase API for pipelining: submit all object PUTs and return the partially
+  // built PreparedValue (with payload_ref already substituted) plus the futures
+  // that callers must wait on before committing the value to RocksDB.
+  PendingPreparedValue PrepareValueAsync(const std::string& value, uint64_t sequence);
+
+  // Blocks until all PUTs in `pending` land, then promotes it to a PreparedValue
+  // (success or first error). On error, prepared.ok is set to false.
+  PreparedValue Finalize(PendingPreparedValue pending);
 
  private:
   TraceLSMConfig config_;
